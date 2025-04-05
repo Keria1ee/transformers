@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from functools import reduce
 from operator import mul
 from typing import List, Optional, Tuple, Union
-
+from .flashatten import flash_attention_custom_mask
 import numpy as np
 import torch
 from torch import nn
@@ -76,6 +76,7 @@ def _stable_argsort(vector, dim):
 
 
 def _get_least_common_mult_chunk_len(config):
+    #根据config中的attn_layers 计算chunk的最小公倍数
     attn_types = config.attn_layers
     attn_types_set = set(attn_types)
     if len(attn_types_set) == 1 and attn_types[0] == "lsh":
@@ -114,14 +115,14 @@ class AxialPositionEmbeddings(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.axial_pos_shape = config.axial_pos_shape
-        self.axial_pos_embds_dim = config.axial_pos_embds_dim
-        self.dropout = config.hidden_dropout_prob
+        self.axial_pos_shape = config.axial_pos_shape #提取出轴的形状
+        self.axial_pos_embds_dim = config.axial_pos_embds_dim #提取出轴的嵌入维度
+        self.dropout = config.hidden_dropout_prob #提取出dropout
 
-        self.least_common_mult_chunk_length = _get_least_common_mult_chunk_len(config)
-        self.weights = nn.ParameterList()
+        self.least_common_mult_chunk_length = _get_least_common_mult_chunk_len(config) #获得最小公倍数
+        self.weights = nn.ParameterList() #存储模型权重
 
-        if sum(self.axial_pos_embds_dim) != config.hidden_size:
+        if sum(self.axial_pos_embds_dim) != config.hidden_size: #嵌入维度和等于隐藏层维度
             raise ValueError(
                 f"Make sure that config.axial_pos_embds factors: {self.axial_pos_embds_dim} sum to "
                 f"config.hidden_size: {config.hidden_size}"
@@ -129,8 +130,9 @@ class AxialPositionEmbeddings(nn.Module):
 
         # create weights
         for axis, axial_pos_embd_dim in enumerate(self.axial_pos_embds_dim):
+            #比如，如果 self.axial_pos_embds_dim 是(32, 64)，那么axis 会依次取 0 和 1，axial_pos_embd_dim会分别取 32 和 64
             # create expanded shapes
-            ax_shape = [1] * len(self.axial_pos_shape)
+            ax_shape = [1] * len(self.axial_pos_shape) #创建一个长度为len(self.axial_pos_shape)的列表，每个元素都是1
             ax_shape[axis] = self.axial_pos_shape[axis]
             ax_shape = tuple(ax_shape) + (axial_pos_embd_dim,)
 
@@ -144,10 +146,10 @@ class AxialPositionEmbeddings(nn.Module):
 
         broadcasted_weights = [
             weight.expand((batch_size,) + self.axial_pos_shape + weight.shape[-1:]) for weight in self.weights
-        ]
+        ]#(batch_size,axis1,axis2,axial_pos_embds_dim)
 
         if self.training is True:
-            if reduce(mul, self.axial_pos_shape) != sequence_length:
+            if reduce(mul, self.axial_pos_shape) != sequence_length: #如果axial_pos_shape的乘积不等于序列长度
                 raise ValueError(
                     f"If training, make sure that config.axial_pos_shape factors: {self.axial_pos_shape} multiply to "
                     f"sequence length. Got prod({self.axial_pos_shape}) != sequence_length: {sequence_length}. "
@@ -156,7 +158,7 @@ class AxialPositionEmbeddings(nn.Module):
                 )
 
             if self.dropout > 0:
-                weights = torch.cat(broadcasted_weights, dim=-1)
+                weights = torch.cat(broadcasted_weights, dim=-1) #按照最后一个维度拼接 shape是(batch_size,axis1,axis2,axial_pos_embds_dim1+axial_pos_embds_dim2)
                 # permute weights so that 2D correctly drops dims 1 and 2
                 transposed_weights = weights.transpose(2, 1)
                 # drop entire matrix of last two dims (prev dims 1 and 2)
@@ -303,7 +305,7 @@ class EfficientAttentionMixin:
         """
         merges attn_head_size dim and num_attn_heads dim into hidden_size
         """
-        x = x.permute(0, 2, 1, 3)
+        x = x.permute(0, 2, 1, 3) #交换维度 0,1,2,3→0,2,1,3 对应之前的转置
         return torch.reshape(x, (x.size()[0], -1, num_attn_heads * attn_head_size))
 
     def _split_seq_length_dim_to(self, vectors, dim_factor_1, dim_factor_2, num_attn_heads, attn_head_size=None):
@@ -367,22 +369,18 @@ class LSHSelfAttention(nn.Module, EfficientAttentionMixin):
         sequence_length = hidden_states.shape[1]
         batch_size = hidden_states.shape[0]
 
-        # num hashes can optionally be overwritten by user
         num_hashes = num_hashes if num_hashes is not None else self.num_hashes
-
         do_cached_attention = use_cache and past_buckets_states[1] is not None
 
-        # check if cache shall be used and that hidden states are already cached
         if do_cached_attention:
             assert sequence_length == 1, (
-                "At the moment, auto-regressive language generation is only possible one word at a time. Make sure"
-                f" that input sequence length {sequence_length} equals 1, when `past_buckets_states` is passed."
+                "At the moment, auto-regressive language generation is only possible one word at a time. "
+                f"Input sequence length {sequence_length} must be 1 when past_buckets_states is passed."
             )
             past_buckets = past_buckets_states[0]
             past_states = past_buckets_states[1]
-
-            # get query vector
             query_vectors = self.query_key(hidden_states)
+            
             query_vectors = self._split_hidden_size_dim(
                 query_vectors, self.num_attention_heads, self.attention_head_size
             )
@@ -400,8 +398,6 @@ class LSHSelfAttention(nn.Module, EfficientAttentionMixin):
                 query_key_vectors = self._query_per_attn_head(key_value_hidden_states)
                 value_vectors = self._value_per_attn_head(key_value_hidden_states)
 
-                # split key & value vectors by num hashes to apply
-                # self attention on each separately
                 query_key_vectors = self._split_seq_length_dim_to(
                     query_key_vectors,
                     num_hashes,
@@ -416,58 +412,53 @@ class LSHSelfAttention(nn.Module, EfficientAttentionMixin):
                     self.num_attention_heads,
                     self.attention_head_size,
                 )
-                # repeat query vectors across hash dimension
+
                 query_vectors = query_vectors.unsqueeze(2).repeat(1, 1, num_hashes, 1, 1)
             else:
                 key_value_hidden_states = torch.cat([past_states, hidden_states], dim=1)
-
                 query_key_vectors = self.query_key(key_value_hidden_states)
                 value_vectors = self.value(key_value_hidden_states)
-
         else:
-            # project hidden_states to query_key and value
             query_vectors = None
             query_key_vectors = self.query_key(hidden_states)
             value_vectors = self.value(hidden_states)
 
-        # if query key is not already split
-        if not do_cached_attention or past_buckets is None:
+        # 如果未做过 split，就在这里进行 split
+        
+        if not do_cached_attention or (do_cached_attention and past_buckets is None):
             query_key_vectors = self._split_hidden_size_dim(
                 query_key_vectors, self.num_attention_heads, self.attention_head_size
             )
+            #基本是这里做分裂 然后赋值给query_vectors
             value_vectors = self._split_hidden_size_dim(
                 value_vectors, self.num_attention_heads, self.attention_head_size
             )
 
-        # cache buckets for next incremental decoding
+        # 缓存逻辑
         if do_cached_attention and past_buckets is None and key_value_hidden_states.shape[1] >= self.chunk_length:
             buckets = self._hash_vectors(query_key_vectors, num_hashes, attention_mask)
 
-        # free memory
-        del hidden_states
+        del hidden_states  # 释放内存
 
         assert (
             query_key_vectors.shape[-1] == self.attention_head_size
-        ), f"last dim of query_key_vectors is {query_key_vectors.shape[-1]} but should be {self.attention_head_size}."
+        ), f"last dim of query_key_vectors is {query_key_vectors.shape[-1]}, should be {self.attention_head_size}."
         assert (
             value_vectors.shape[-1] == self.attention_head_size
-        ), f"last dim of value_vectors is {value_vectors.shape[-1]} but should be {self.attention_head_size}."
+        ), f"last dim of value_vectors is {value_vectors.shape[-1]}, should be {self.attention_head_size}."
 
         do_standard_self_attention = (sequence_length <= self.chunk_length) or (
             use_cache and past_buckets_states[1] is not None
         )
-        # LSH attention only makes sense if chunked attention should be performed
+        # 测试案例是false
         if not do_standard_self_attention:
-            # set `num_buckets` on the fly, recommended way to do it
             if self.num_buckets is None:
                 self._set_num_buckets(sequence_length)
 
-            # use cached buckets for backprop only
             if buckets is None:
-                # hash query key vectors into buckets
+                #PATH
                 buckets = self._hash_vectors(query_key_vectors, num_hashes, attention_mask)
             else:
-                # make sure buckets has correct shape for LSH attention
                 buckets = buckets.view(batch_size, self.num_attention_heads, num_hashes * sequence_length)
 
             assert (
@@ -477,13 +468,10 @@ class LSHSelfAttention(nn.Module, EfficientAttentionMixin):
             sorted_bucket_idx, undo_sorted_bucket_idx = self._get_sorted_bucket_idx_and_undo_sorted_bucket_idx(
                 sequence_length, buckets, num_hashes
             )
-
-            # make sure bucket idx is not longer then sequence length
             sorted_bucket_idx_per_hash = sorted_bucket_idx % sequence_length
-
-            # cluster query key value vectors according to hashed buckets
             query_key_vectors = self._gather_by_expansion(query_key_vectors, sorted_bucket_idx_per_hash, num_hashes)
             value_vectors = self._gather_by_expansion(value_vectors, sorted_bucket_idx_per_hash, num_hashes)
+
             query_key_vectors = self._split_seq_length_dim_to(
                 query_key_vectors,
                 -1,
@@ -498,53 +486,143 @@ class LSHSelfAttention(nn.Module, EfficientAttentionMixin):
                 self.num_attention_heads,
                 self.attention_head_size,
             )
-
-            if self.chunk_length is None:
-                assert self.num_chunks_before == 0 and self.num_chunks_after == 0, (
-                    "If `config.chunk_length` is `None`, make sure `config.num_chunks_after` and"
-                    " `config.num_chunks_before` are set to 0."
-                )
+            
+            
         elif do_cached_attention and past_buckets is not None:
-            # use max sequence length
             sorted_bucket_idx_per_hash = sorted_bucket_idx
         else:
-            # get sequence length indices
             sorted_bucket_idx_per_hash = torch.arange(sequence_length, device=query_key_vectors.device).repeat(
                 batch_size, self.num_attention_heads, 1
             )
-
-        # scale key vectors
+        
         sqrt_num = np.sqrt(self.attention_head_size)
         key_vectors = self._len_and_dim_norm(query_key_vectors, sqrt_num)
-
-        # set query_vectors to query key vectors if LSH self attention
+        # 如果是 standard_self_attention，query_vectors 就设为 query_key_vectors
         query_vectors = query_vectors if query_vectors is not None else query_key_vectors
+        del query_key_vectors  # 释放内存
+    
+        
+        #判断好了 使用的是query_key_vectors
+        # ---------------------------------------------------------------------
+        # 这里开始直接展开原先 _attend(...) 内部的逻辑
+        # ---------------------------------------------------------------------
+        # 1) 处理 chunked attention，拼接相邻 block
+        # if not do_standard_self_attention:
+        #     key_vectors = self._look_adjacent(key_vectors,
+        #                                       self.num_chunks_before,
+        #                                       self.num_chunks_after)
+        #     value_vectors = self._look_adjacent(value_vectors,
+        #                                         self.num_chunks_before,
+        #                                         self.num_chunks_after)
+        
+        # 2) 计算 QK 的点积的形状
+        if query_vectors.ndim > 4:
+            query_key_dots_shape =(query_vectors.shape[0],query_vectors.shape[1],query_vectors.shape[2],query_vectors.shape[3],key_vectors.shape[3])
+        else:
+            query_key_dots_shape =(query_vectors.shape[0],query_vectors.shape[1],query_vectors.shape[2],key_vectors.shape[2])
 
-        # free memory
-        del query_key_vectors
-
-        # get attention probs
-        out_vectors, logits, attention_probs = self._attend(
-            query_vectors=query_vectors,
-            key_vectors=key_vectors,
-            value_vectors=value_vectors,
-            sorted_bucket_idx_per_hash=sorted_bucket_idx_per_hash,
-            attention_mask=attention_mask,
-            head_mask=head_mask,
-            do_standard_self_attention=do_standard_self_attention,
-            do_cached_attention=do_cached_attention,
-        )
-
-        # free memory
-        del key_vectors, value_vectors
-
-        # re-order out_vectors and logits
+        # 3) 计算 query_bucket_idx 和 key_value_bucket_idx
         if not do_standard_self_attention:
-            # sort clusters back to correct ordering
+            query_bucket_idx = self._split_seq_length_dim_to(
+                sorted_bucket_idx_per_hash,
+                -1,
+                self.chunk_length,
+                self.num_attention_heads
+            )
+            key_value_bucket_idx =query_bucket_idx
+            # key_value_bucket_idx = self._look_adjacent(query_bucket_idx,
+            #                                            self.num_chunks_before,
+            #                                            self.num_chunks_after)
+        elif do_cached_attention and len(query_key_dots_shape)> 4:
+            key_value_bucket_idx = sorted_bucket_idx_per_hash
+            query_bucket_idx = (
+                key_value_bucket_idx.new_ones(key_value_bucket_idx.shape[:-1] + (1,))
+                * key_value_bucket_idx.max()
+            )
+        elif do_cached_attention and len(query_key_dots_shape) <= 4:
+            
+            query_bucket_idx = (query_key_dots.shape[-1] - 1) * torch.ones(
+                query_key_dots_shape[:-1],  # 去掉最后一个维度
+                dtype=query_vectors.dtype,  # 从 query_vectors 提取 dtype
+                device=query_vectors.device  # 从 query_vectors 提取 device
+            )
+            key_value_bucket_idx = torch.arange(
+                query_key_dots_shape[-1],
+                dtype=torch.long,
+                device=query_key_dots.device
+            )[None, None, :].expand(query_bucket_idx.shape[:2] + (-1,))
+        else:
+            query_bucket_idx = key_value_bucket_idx = sorted_bucket_idx_per_hash
+        # 4) 根据精度选取 mask 值
+        if query_vectors.dtype == torch.float16:
+            self_mask_value = self.self_mask_value_float16.half()
+            mask_value = self.mask_value_float16.half()
+        else:
+            self_mask_value = self.self_mask_value_float32
+            mask_value = self.mask_value_float32
+
+        # 5) 计算并应用 attention mask
+        if not do_cached_attention:
+            mask = self._compute_attn_mask(
+                query_bucket_idx,
+                key_value_bucket_idx,
+                attention_mask,
+                query_key_dots_shape,
+                do_standard_self_attention,
+            )
+        else:
+            mask = None
+        # 6) 自遮罩：防止 Token attend 到自己
+        del query_key_dots_shape  # 释放内存
+        self_mask = torch.ne(query_bucket_idx.unsqueeze(-1),
+                             key_value_bucket_idx.unsqueeze(-2)).to(query_bucket_idx.device)
+        if mask is not None:
+                combined_mask = mask & self_mask
+        print('q shape',query_vectors.shape)
+        print('k shape',key_vectors.shape)
+        print('v shape',value_vectors.shape)
+        query_key_dots = torch.matmul(query_vectors, key_vectors.transpose(-1, -2))
+        query_key_dots = torch.where(combined_mask, query_key_dots, mask_value)
+        
+        # ---------------------------------------------------------------------
+        # 这里是pytorch的Attention计算过程
+        # ---------------------------------------------------------------------
+        del query_vectors, key_vectors  # 释放内存
+        
+        # 7) 计算 logits 和注意力概率
+        logits = torch.logsumexp(query_key_dots, dim=-1, keepdim=True)
+        attention_probs = torch.exp(query_key_dots - logits)
+        del query_key_dots  # 释放
+
+        # 8) dropout
+        attention_probs = nn.functional.dropout(attention_probs,
+                                               p=self.dropout,
+                                               training=self.training)
+
+        # 9) 如果有 head_mask，则对注意力概率进行 mask
+        if head_mask is not None:
+            attention_probs = attention_probs * head_mask
+
+
+        # 10) 计算最终的注意力输出
+        out_vectors = torch.matmul(attention_probs, value_vectors)
+        # out_vectors =flash_attention_custom_mask(query_vectors, key_vectors, value_vectors,combined_mask)
+        del mask, self_mask, combined_mask  # 释放内存
+        del value_vectors  # 释放
+        # 11) 如果有 chunk 维度，需要做 flatten
+        if out_vectors.ndim > 4:
+            logits = logits.flatten(start_dim=2, end_dim=3).squeeze(-1)
+            out_vectors = out_vectors.flatten(start_dim=2, end_dim=3)
+        # ---------------------------------------------------------------------
+        # _attend(...) 内联结束
+        # ---------------------------------------------------------------------
+
+        # 之后的逻辑保持不变
+        if not do_standard_self_attention:
+            # 将排序后的向量和 logits 逆排序回去（如果需要）
             out_vectors, logits = ReverseSort.apply(out_vectors, logits, sorted_bucket_idx, undo_sorted_bucket_idx)
 
         if not do_standard_self_attention or (do_cached_attention and past_buckets is not None):
-            # sum up all hash rounds
             if num_hashes > 1:
                 out_vectors = self._split_seq_length_dim_to(
                     out_vectors,
@@ -563,10 +641,7 @@ class LSHSelfAttention(nn.Module, EfficientAttentionMixin):
 
                 probs_vectors = torch.exp(logits - torch.logsumexp(logits, dim=2, keepdim=True))
                 out_vectors = torch.sum(out_vectors * probs_vectors, dim=2)
-                # free memory
                 del probs_vectors
-
-            # free memory
             del logits
 
         assert out_vectors.shape == (
@@ -575,11 +650,12 @@ class LSHSelfAttention(nn.Module, EfficientAttentionMixin):
             sequence_length,
             self.attention_head_size,
         ), (
-            "out_vectors have be of shape `[batch_size, config.num_attention_heads, sequence_length,"
-            " config.attention_head_size]`."
+            "out_vectors shape must be [batch_size, num_attention_heads, sequence_length, attention_head_size]."
         )
 
-        out_vectors = self._merge_hidden_size_dims(out_vectors, self.num_attention_heads, self.attention_head_size)
+        out_vectors = self._merge_hidden_size_dims(
+            out_vectors, self.num_attention_heads, self.attention_head_size
+        )
 
         if output_attentions is False:
             attention_probs = ()
@@ -587,7 +663,11 @@ class LSHSelfAttention(nn.Module, EfficientAttentionMixin):
         if buckets is not None:
             buckets = buckets.view(batch_size, self.num_attention_heads, num_hashes, -1)
 
-        return LSHSelfAttentionOutput(hidden_states=out_vectors, attention_probs=attention_probs, buckets=buckets)
+        return LSHSelfAttentionOutput(
+            hidden_states=out_vectors,
+            attention_probs=attention_probs,
+            buckets=buckets
+        )
 
     def _query_per_attn_head(self, hidden_states):
         per_head_query_key = self.query_key.weight.reshape(
@@ -843,7 +923,7 @@ class LSHSelfAttention(nn.Module, EfficientAttentionMixin):
                 attention_mask = attention_mask.expand(query_indices.shape[:-1] + (-1,))
                 # extract attention mask from LSH sorted key_indices
                 attention_mask = torch.gather(attention_mask, -1, key_indices)
-
+                
             attention_mask = attention_mask.unsqueeze(-2).expand(query_key_dot_shape)
 
         # Causal mask
@@ -2560,6 +2640,8 @@ class ReformerForSequenceClassification(ReformerPreTrainedModel):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+
+
 
 
 class ReformerClassificationHead(nn.Module):
